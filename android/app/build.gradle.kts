@@ -8,7 +8,8 @@ plugins {
 android {
     namespace = "com.cms.cms_display_app"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    // Override Flutter's default NDK to match the plugins' requirement.
+    ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -35,6 +36,10 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // Disable code shrinking/obfuscation (R8) to avoid FileSystemException
+            // on classes.dex being locked by another process.
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }

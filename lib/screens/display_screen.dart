@@ -512,14 +512,26 @@ class DisplayScreenState extends State<DisplayScreen> {
 
   void _videoListener() {
     if (_videoController == null || !mounted || _videoEndHandled) return;
-    final pos = _videoController!.value.position;
-    final dur = _videoController!.value.duration;
-    final hasError = _videoController!.value.hasError;
-    final errorDescription = _videoController!.value.errorDescription;
+    final value = _videoController!.value;
+    final pos = value.position;
+    final dur = value.duration;
+    final hasError = value.hasError;
+    final errorDescription = value.errorDescription;
 
     if (hasError) {
       print('🎥 DEBUG: Video error detected!');
       print('🎥 DEBUG: Error description: $errorDescription');
+      // On Windows (and other platforms), an unhandled error here can leave the
+      // UI stuck on a loading spinner. Surface the error briefly, then skip.
+      if (_mediaList.isNotEmpty) {
+        final media = _mediaList[_currentIndex];
+        _showVideoErrorAndSkip(
+          errorDescription ?? 'Video playback error',
+          media,
+        );
+      } else {
+        _nextMedia();
+      }
       return;
     }
 

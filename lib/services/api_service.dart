@@ -86,6 +86,7 @@ class ApiService {
           fileType: media.fileType,
           fileSize: media.fileSize,
           previewUrl: previewUrl,
+          playbackScheduleSeconds: media.playbackScheduleSeconds,
           updatedAt: media.updatedAt,
         ));
       }

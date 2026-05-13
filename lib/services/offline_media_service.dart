@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:hive_flutter/hive_flutter.dart';
-import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as path;
 
@@ -15,6 +14,12 @@ class OfflineMediaService {
   static const _listPrefix = 'list_';
   static const _pathsPrefix = 'paths_';
   static const _mediaDirName = 'cms_media';
+
+  /// Skip auto-caching very large videos — streams in app; avoids blocking + memory spike from one-shot HTTP body.
+  static const _maxBackgroundCacheVideoBytes = 80 * 1024 * 1024;
+
+  static const _downloadUserAgent =
+      'Mozilla/5.0 (Linux; Android 10; Android TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.0.0 Mobile Safari/537.36';
 
   Box<dynamic>? _box;
 
@@ -114,27 +119,48 @@ class OfflineMediaService {
     return 'bin';
   }
 
-  /// Download media file and save locally; store path in Hive.
+  /// Download media file and save locally; store path in Hive. Streams to disk (no whole-file RAM load).
   Future<String?> cacheMediaFile(String mac, MediaItem media) async {
+    HttpClient? httpClient;
     try {
       final dir = await _mediaDir(mac);
       final ext = _extensionFromMime(media.fileType);
       final file = File(path.join(dir.path, '${media.id}.$ext'));
-      final response = await http.get(Uri.parse(media.previewUrl));
-      if (response.statusCode != 200) return null;
-      await file.writeAsBytes(response.bodyBytes);
+      httpClient = HttpClient();
+      httpClient.connectionTimeout = const Duration(seconds: 45);
+      httpClient.idleTimeout = const Duration(seconds: 120);
+      final uri = Uri.parse(media.previewUrl);
+      final request = await httpClient.getUrl(uri);
+      request.headers.set(HttpHeaders.userAgentHeader, _downloadUserAgent);
+      request.headers.set(HttpHeaders.acceptHeader, '*/*');
+      final response = await request.close();
+      if (response.statusCode != 200 && response.statusCode != 206) return null;
+      final sink = file.openWrite();
+      try {
+        await sink.addStream(response);
+      } finally {
+        await sink.close();
+      }
+      if (!await file.exists() || await file.length() == 0) return null;
       await saveLocalPath(mac, media.id, file.path);
       return file.path;
     } catch (_) {
       return null;
+    } finally {
+      httpClient?.close(force: true);
     }
   }
 
-  /// Cache all media files in background. Call after saving list when online.
+  /// Cache all media files in background. Very large videos are skipped so playback uses streaming.
   Future<void> cacheAllInBackground(String mac, List<MediaItem> list) async {
     for (final media in list) {
       if (!media.isPlayable) continue;
       if (getLocalPath(mac, media.id) != null) continue;
+      if (media.isVideo &&
+          media.fileSize > 0 &&
+          media.fileSize >= _maxBackgroundCacheVideoBytes) {
+        continue;
+      }
       await cacheMediaFile(mac, media);
     }
     await _refreshListWithPaths(mac);
@@ -152,6 +178,7 @@ class OfflineMediaService {
         fileType: m.fileType,
         fileSize: m.fileSize,
         previewUrl: m.previewUrl,
+        playbackScheduleSeconds: m.playbackScheduleSeconds,
         updatedAt: m.updatedAt,
         localPath: p,
       );
@@ -170,6 +197,7 @@ class OfflineMediaService {
         fileType: m.fileType,
         fileSize: m.fileSize,
         previewUrl: m.previewUrl,
+        playbackScheduleSeconds: m.playbackScheduleSeconds,
         updatedAt: m.updatedAt,
         localPath: local,
       );

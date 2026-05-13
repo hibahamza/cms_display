@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CMS Display</string>
+    <string name="mac_address">MAC Address</string>
+    <string name="mac_hint">e.g. 58:c5:87:67:7e:39</string>
+    <string name="save_and_play">Save &amp; Play</string>
+    <string name="enter_mac">Enter device MAC address</string>
+    <string name="settings">Settings</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="retry">Retry</string>
+    <string name="loading_media">Loading media…</string>
+    <string name="loading_video">Loading video…</string>
+    <string name="no_media_found">No media found</string>
+    <string name="please_enter_mac">Please enter a MAC address</string>
+    <string name="open_video_in_app">Open video in app</string>
+</resources>

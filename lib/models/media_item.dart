@@ -7,6 +7,8 @@ class MediaItem {
   final String fileType;
   final int fileSize;
   final String previewUrl;
+  /// Optional per-item play duration in seconds (image/video). Null means use defaults.
+  final int? playbackScheduleSeconds;
   final String? updatedAt;
   /// Local file path when cached for offline playback.
   final String? localPath;
@@ -17,17 +19,20 @@ class MediaItem {
     required this.fileType,
     required this.fileSize,
     required this.previewUrl,
+    this.playbackScheduleSeconds,
     this.updatedAt,
     this.localPath,
   });
 
   factory MediaItem.fromJson(Map<String, dynamic> json) {
+    final schedule = json['playback_schedule_seconds'] ?? json['playbackScheduleSeconds'];
     return MediaItem(
       id: (json['id'] as num).toInt(),
       title: json['title'] as String? ?? '',
       fileType: json['file_type'] as String? ?? 'image/jpeg',
       fileSize: (json['file_size'] as num?)?.toInt() ?? 0,
       previewUrl: json['preview_url'] as String? ?? '',
+      playbackScheduleSeconds: (schedule as num?)?.toInt(),
       updatedAt: json['updated_at'] as String?,
       localPath: json['local_path'] as String?,
     );
@@ -41,6 +46,8 @@ class MediaItem {
       'file_type': fileType,
       'file_size': fileSize,
       'preview_url': previewUrl,
+      if (playbackScheduleSeconds != null)
+        'playback_schedule_seconds': playbackScheduleSeconds,
       'updated_at': updatedAt,
       if (localPath != null) 'local_path': localPath,
     };
@@ -53,6 +60,8 @@ class MediaItem {
       fileType: map['file_type'] as String? ?? 'image/jpeg',
       fileSize: (map['file_size'] as num?)?.toInt() ?? 0,
       previewUrl: map['preview_url'] as String? ?? '',
+      playbackScheduleSeconds:
+          (map['playback_schedule_seconds'] as num?)?.toInt(),
       updatedAt: map['updated_at'] as String?,
       localPath: map['local_path'] as String?,
     );

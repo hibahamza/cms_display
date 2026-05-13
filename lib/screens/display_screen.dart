@@ -31,16 +31,24 @@ class DisplayScreen extends StatefulWidget {
   State<DisplayScreen> createState() => DisplayScreenState();
 }
 
-class DisplayScreenState extends State<DisplayScreen> {
+class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserver {
   static const _imageDuration = Duration(seconds: 10);
+  /// Background API poll so backend playlist changes (new video, etc.) apply without app restart.
+  static const _cmsRefreshInterval = Duration(minutes: 2);
+  /// First silent refresh soon after start so admins do not wait a full interval.
+  static const _cmsFirstRefreshDelay = Duration(seconds: 20);
 
   List<MediaItem> _mediaList = [];
   int _currentIndex = 0;
   bool _loading = true;
   String? _error;
   Timer? _imageTimer;
+  Timer? _scheduledNextTimer;
   VideoPlayerController? _videoController;
   bool _videoEndHandled = false;
+  bool _videoInitializing = false;
+  Timer? _videoStallTimer;
+  Duration _videoStallStartPos = Duration.zero;
 
   /// Temp file path when playing a downloaded stream (e.g. Android TV fallback); deleted on next/skip.
   String? _tempVideoPath;
@@ -49,18 +57,54 @@ class DisplayScreenState extends State<DisplayScreen> {
   /// Brief message when video download/play fails (cleared on next media).
   String? _videoError;
 
+  Timer? _cmsRefreshTimer;
+  Timer? _cmsFirstRefreshTimer;
+  bool _cmsBackgroundRefreshInFlight = false;
+
   ApiService get _api => ApiService(baseUrl: widget.settings.baseUrl);
   String get _mac => widget.settings.macAddress;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _fetchMedia();
+    _startCmsRefreshTimer();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_refreshCmsMediaIfOnline());
+    }
+  }
+
+  /// Not only wifi/mobile/ethernet — Android TV / box often reports [other] or [vpn] when online.
+  bool _isOnlineForApi(List<ConnectivityResult> results) {
+    if (results.isEmpty) return true;
+    return results.any((c) => c != ConnectivityResult.none);
+  }
+
+  void _startCmsRefreshTimer() {
+    _cmsRefreshTimer?.cancel();
+    _cmsFirstRefreshTimer?.cancel();
+    _cmsFirstRefreshTimer = Timer(_cmsFirstRefreshDelay, () {
+      if (!mounted) return;
+      unawaited(_refreshCmsMediaIfOnline());
+    });
+    _cmsRefreshTimer = Timer.periodic(_cmsRefreshInterval, (_) {
+      unawaited(_refreshCmsMediaIfOnline());
+    });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _cmsFirstRefreshTimer?.cancel();
+    _cmsRefreshTimer?.cancel();
     _imageTimer?.cancel();
+    _scheduledNextTimer?.cancel();
+    _videoStallTimer?.cancel();
     _videoController?.dispose();
     super.dispose();
   }
@@ -199,16 +243,7 @@ class DisplayScreenState extends State<DisplayScreen> {
       _error = null;
     });
     final results = await Connectivity().checkConnectivity();
-    final isOnline =
-        results.isNotEmpty &&
-        results.any(
-          (c) =>
-              c == ConnectivityResult.wifi ||
-              c == ConnectivityResult.mobile ||
-              c == ConnectivityResult.ethernet,
-        );
-
-    if (isOnline) {
+    if (_isOnlineForApi(results)) {
       try {
         final list = await _api.getDeviceMedia(_mac);
         var playable = list.where((m) => m.isPlayable).toList();
@@ -253,19 +288,73 @@ class DisplayScreenState extends State<DisplayScreen> {
     }
   }
 
+  /// True when API list differs (new/removed media, or order change). Compares id sets and order.
+  bool _playlistChanged(List<MediaItem> a, List<MediaItem> b) {
+    if (a.length != b.length) return true;
+    final sa = [...a.map((e) => e.id)]..sort();
+    final sb = [...b.map((e) => e.id)]..sort();
+    for (var i = 0; i < sa.length; i++) {
+      if (sa[i] != sb[i]) return true;
+    }
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].id != b[i].id) return true;
+    }
+    return false;
+  }
+
+  /// Silent background fetch: does not show loading screen; updates loop if playlist changed.
+  /// Does not use [_loading] so the first scheduled refresh is not skipped during a slow initial fetch.
+  Future<void> _refreshCmsMediaIfOnline() async {
+    if (!mounted || _mac.trim().isEmpty || _cmsBackgroundRefreshInFlight) return;
+    final results = await Connectivity().checkConnectivity();
+    if (!_isOnlineForApi(results) || !mounted) return;
+    _cmsBackgroundRefreshInFlight = true;
+    try {
+      final list = await _api.getDeviceMedia(_mac);
+      var playable = list.where((m) => m.isPlayable).toList();
+      playable = widget.offlineMedia.mergeWithLocalPaths(_mac, playable);
+      await widget.offlineMedia.saveMediaList(_mac, playable);
+      unawaited(widget.offlineMedia.cacheAllInBackground(_mac, playable));
+      if (!mounted) return;
+      if (!_playlistChanged(_mediaList, playable)) return;
+      setState(() {
+        _mediaList = playable;
+        _currentIndex = 0;
+        _error = playable.isEmpty ? 'No media found for this device' : null;
+      });
+      if (playable.isNotEmpty) _playCurrent();
+    } catch (_) {
+      // Background refresh failure is ignored; user keeps current playback.
+    } finally {
+      _cmsBackgroundRefreshInFlight = false;
+    }
+  }
+
   void _playCurrent() {
     if (_mediaList.isEmpty) return;
     _imageTimer?.cancel();
-    _videoController?.dispose();
+    _scheduledNextTimer?.cancel();
+    _videoStallTimer?.cancel();
+    final toDispose = _videoController;
+    _videoController?.removeListener(_videoListener);
     _videoController = null;
+    _videoInitializing = false;
 
     final media = _mediaList[_currentIndex];
     if (media.isImage) {
-      _imageTimer = Timer(_imageDuration, _nextMedia);
+      final secs = media.playbackScheduleSeconds;
+      final duration =
+          (secs != null && secs > 0) ? Duration(seconds: secs) : _imageDuration;
+      _imageTimer = Timer(duration, _nextMedia);
     } else if (media.isVideo) {
       _playVideo(media);
     } else {
       _nextMedia();
+    }
+    if (toDispose != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        toDispose.dispose();
+      });
     }
   }
 
@@ -289,12 +378,30 @@ class DisplayScreenState extends State<DisplayScreen> {
     );
   }
 
-  /// Headers for video stream. Browser-like UA often works better on Android TV than ExoPlayer UA.
+  /// Browser-like UA; large MP4s need slower stall detection and longer [initialize] timeout.
   static const _videoHeaders = <String, String>{
     'User-Agent':
         'Mozilla/5.0 (Linux; Android 10; Android TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Safari/537.36',
     'Accept': '*/*',
   };
+
+  Duration _videoPlayerInitTimeout(MediaItem media) {
+    final b = media.fileSize;
+    if (b <= 0) return const Duration(seconds: 90);
+    if (b > 260 * 1024 * 1024) return const Duration(seconds: 300);
+    if (b > 100 * 1024 * 1024) return const Duration(seconds: 180);
+    if (b > 40 * 1024 * 1024) return const Duration(seconds: 90);
+    return const Duration(seconds: 45);
+  }
+
+  /// Large/network MP4s may buffer longer before frames advance — avoid skipping as "stalled".
+  Duration _videoStallFirstCheckDelay(MediaItem media) {
+    final b = media.fileSize;
+    if (b > 200 * 1024 * 1024) return const Duration(seconds: 55);
+    if (b > 90 * 1024 * 1024) return const Duration(seconds: 35);
+    if (b > 35 * 1024 * 1024) return const Duration(seconds: 18);
+    return const Duration(seconds: 6);
+  }
 
   void _playVideo(MediaItem media, {int retryCount = 0}) {
     print('🎥 DEBUG: Starting video playback for media ID: ${media.id}');
@@ -306,19 +413,20 @@ class DisplayScreenState extends State<DisplayScreen> {
     print('🎥 DEBUG: Retry count: $retryCount');
 
     _videoEndHandled = false;
+    _videoError = null;
+    _videoErrorUrl = null;
+    _videoInitializing = true;
+    setState(() {});
     if (media.isCached && media.localPath != null) {
       print('🎥 DEBUG: Using cached file: ${media.localPath}');
       _videoController = VideoPlayerController.file(File(media.localPath!));
       _initAndPlayVideoController();
       return;
     }
-    // Use exact previewUrl from API (same URL that works for images).
     final videoUri = media.previewUrl.isNotEmpty
         ? Uri.parse(media.previewUrl)
         : _streamUri(media.id);
-
     print('🎥 DEBUG: Final video URI: $videoUri');
-
     _videoController = VideoPlayerController.networkUrl(
       videoUri,
       httpHeaders: _videoHeaders,
@@ -328,41 +436,83 @@ class DisplayScreenState extends State<DisplayScreen> {
     _videoController!
         .initialize()
         .timeout(
-          const Duration(seconds: 30),
+          _videoPlayerInitTimeout(media),
           onTimeout: () => throw TimeoutException('Video load timeout'),
         )
         .then((_) {
           print('🎥 DEBUG: Video initialized successfully!');
-          print(
-            '🎥 DEBUG: Video duration: ${_videoController!.value.duration}',
-          );
-          print('🎥 DEBUG: Video size: ${_videoController!.value.size}');
-          print(
-            '🎥 DEBUG: Video aspect ratio: ${_videoController!.value.aspectRatio}',
-          );
           if (!mounted) return;
+          _videoInitializing = false;
           _videoController!.play();
-          print('🎥 DEBUG: Video play() called');
           setState(() {});
           _videoController!.addListener(_videoListener);
+          _armVideoStallWatchdog();
+          _armVideoScheduleSlotTimer();
         })
         .catchError((e) {
           print('🎥 DEBUG: Video initialization failed: $e');
-          print('🎥 DEBUG: Error type: ${e.runtimeType}');
           if (!mounted) return;
+          _videoInitializing = false;
+          setState(() {});
           if (retryCount < 1) {
             print('🎥 DEBUG: Retrying video playback...');
             _videoController?.dispose();
             _videoController = null;
             _playVideo(media, retryCount: retryCount + 1);
           } else {
-            print('🎥 DEBUG: Max retries reached, skipping to next media');
             _nextMedia();
           }
         });
   }
 
-  /// Android: try streaming with previewUrl first; on failure, download then play.
+  /// Wall-clock slot for scheduled video: when slot ends, advance playlist.
+  /// Started when playback actually begins ([play] after [initialize]).
+  /// Images use [_imageTimer] in [_playCurrent] instead.
+  void _armVideoScheduleSlotTimer() {
+    _scheduledNextTimer?.cancel();
+    if (_mediaList.isEmpty) return;
+    final media = _mediaList[_currentIndex];
+    final secs = media.playbackScheduleSeconds;
+    if (!media.isVideo || secs == null || secs <= 0) return;
+    _scheduledNextTimer = Timer(Duration(seconds: secs), () {
+      if (!mounted) return;
+      _videoEndHandled = true;
+      _nextMedia();
+    });
+  }
+
+  void _armVideoStallWatchdog() {
+    _videoStallTimer?.cancel();
+    final c = _videoController;
+    if (c == null) return;
+    final media =
+        (_mediaList.isNotEmpty && _currentIndex < _mediaList.length)
+            ? _mediaList[_currentIndex]
+            : null;
+    final firstCheck = media != null
+        ? _videoStallFirstCheckDelay(media)
+        : const Duration(seconds: 8);
+    _videoStallStartPos = c.value.position;
+    _videoStallTimer = Timer(firstCheck, () {
+      if (!mounted) return;
+      final controller = _videoController;
+      if (controller == null) return;
+      final v = controller.value;
+      if (v.hasError) return;
+      final advanced =
+          v.position > _videoStallStartPos + const Duration(milliseconds: 250);
+      if (!advanced) {
+        final msg = 'Video stalled (no frames).';
+        final current = _mediaList.isNotEmpty ? _mediaList[_currentIndex] : null;
+        if (current != null) {
+          _showVideoErrorAndSkip(msg, current);
+        } else {
+          _nextMedia();
+        }
+      }
+    });
+  }
+
   void _tryStreamThenDownload(MediaItem media, Uri videoUri) {
     _videoController = VideoPlayerController.networkUrl(
       videoUri,
@@ -372,7 +522,7 @@ class DisplayScreenState extends State<DisplayScreen> {
     _videoController!
         .initialize()
         .timeout(
-          const Duration(seconds: 25),
+          _videoPlayerInitTimeout(media),
           onTimeout: () => throw TimeoutException('Stream timeout'),
         )
         .then((_) {
@@ -380,43 +530,41 @@ class DisplayScreenState extends State<DisplayScreen> {
           _videoController!.play();
           setState(() {});
           _videoController!.addListener(_videoListener);
+          _armVideoScheduleSlotTimer();
         })
         .catchError((e) {
           if (!mounted) return;
           _videoController?.dispose();
           _videoController = null;
-          // Fall back to download (longer timeout for large files).
           _downloadAndPlayVideo(media);
         });
   }
 
   void _initAndPlayVideoController() {
-    print('🎥 DEBUG: Initializing cached video controller...');
     _videoController!.setLooping(false);
+    final m = (_mediaList.isNotEmpty && _currentIndex < _mediaList.length)
+        ? _mediaList[_currentIndex]
+        : null;
+    final initTimeout = m != null
+        ? _videoPlayerInitTimeout(m)
+        : const Duration(seconds: 60);
     _videoController!
         .initialize()
         .timeout(
-          const Duration(seconds: 20),
+          initTimeout,
           onTimeout: () => throw TimeoutException('Video load timeout'),
         )
         .then((_) {
-          print('🎥 DEBUG: Cached video initialized successfully!');
-          print(
-            '🎥 DEBUG: Video duration: ${_videoController!.value.duration}',
-          );
-          print('🎥 DEBUG: Video size: ${_videoController!.value.size}');
-          print(
-            '🎥 DEBUG: Video aspect ratio: ${_videoController!.value.aspectRatio}',
-          );
           if (!mounted) return;
+          _videoInitializing = false;
           _videoController!.play();
-          print('🎥 DEBUG: Cached video play() called');
           setState(() {});
           _videoController!.addListener(_videoListener);
+          _armVideoStallWatchdog();
+          _armVideoScheduleSlotTimer();
         })
         .catchError((e) {
-          print('🎥 DEBUG: Cached video initialization failed: $e');
-          print('🎥 DEBUG: Error type: ${e.runtimeType}');
+          _videoInitializing = false;
           if (mounted) _nextMedia();
         });
   }
@@ -429,10 +577,10 @@ class DisplayScreenState extends State<DisplayScreen> {
     final uri = media.previewUrl.isNotEmpty
         ? Uri.parse(media.previewUrl)
         : _streamUri(media.id);
-    // 100MB+ needs ~5 min on slow links; minimum 2 min.
-    final seconds = (120 + (media.fileSize / (2 * 1024 * 1024)).ceil()).clamp(
-      120,
-      600,
+    // ~1s per MB baseline; 300MB+ needs 30+ minutes on slow links; cap 45 min.
+    final seconds = (180 + (media.fileSize / (1024 * 1024)).ceil()).clamp(
+      180,
+      2700,
     );
     final overallTimeout = Duration(seconds: seconds);
     try {
@@ -450,8 +598,9 @@ class DisplayScreenState extends State<DisplayScreen> {
 
   Future<void> _downloadAndPlayVideoInner(MediaItem media, Uri uri) async {
     final client = HttpClient();
-    client.connectionTimeout = const Duration(seconds: 15);
-    client.idleTimeout = const Duration(seconds: 60);
+    client.connectionTimeout = const Duration(seconds: 45);
+    client.idleTimeout =
+        const Duration(seconds: 120); // slow reads on large files
     try {
       final request = await client.getUrl(uri);
       for (final e in _videoHeaders.entries) {
@@ -484,6 +633,7 @@ class DisplayScreenState extends State<DisplayScreen> {
       _videoController!.play();
       setState(() {});
       _videoController!.addListener(_videoListener);
+      _armVideoScheduleSlotTimer();
     } finally {
       client.close(force: true);
     }
@@ -517,12 +667,7 @@ class DisplayScreenState extends State<DisplayScreen> {
     final dur = value.duration;
     final hasError = value.hasError;
     final errorDescription = value.errorDescription;
-
     if (hasError) {
-      print('🎥 DEBUG: Video error detected!');
-      print('🎥 DEBUG: Error description: $errorDescription');
-      // On Windows (and other platforms), an unhandled error here can leave the
-      // UI stuck on a loading spinner. Surface the error briefly, then skip.
       if (_mediaList.isNotEmpty) {
         final media = _mediaList[_currentIndex];
         _showVideoErrorAndSkip(
@@ -534,10 +679,26 @@ class DisplayScreenState extends State<DisplayScreen> {
       }
       return;
     }
-
     if (dur.inMilliseconds > 0 &&
         pos >= dur - const Duration(milliseconds: 500)) {
-      print('🎥 DEBUG: Video ended, moving to next media');
+      final media = (_mediaList.isNotEmpty &&
+              _currentIndex < _mediaList.length)
+          ? _mediaList[_currentIndex]
+          : null;
+      final sched = media?.playbackScheduleSeconds;
+      if (media != null &&
+          media.isVideo &&
+          sched != null &&
+          sched > 0 &&
+          (_scheduledNextTimer?.isActive ?? false)) {
+        unawaited(
+          _videoController!.seekTo(Duration.zero).then((_) {
+            if (!mounted || _videoController == null) return;
+            _videoController!.play();
+          }),
+        );
+        return;
+      }
       _videoEndHandled = true;
       _videoController!.removeListener(_videoListener);
       _nextMedia();
@@ -546,10 +707,13 @@ class DisplayScreenState extends State<DisplayScreen> {
 
   void _nextMedia() {
     _imageTimer?.cancel();
+    _scheduledNextTimer?.cancel();
+    _videoStallTimer?.cancel();
+    final toDispose = _videoController;
     _videoController?.removeListener(_videoListener);
-    _videoController?.dispose();
     _videoController = null;
     _videoDownloading = false;
+    _videoInitializing = false;
     _videoError = null;
     _videoErrorUrl = null;
     if (_tempVideoPath != null) {
@@ -558,11 +722,23 @@ class DisplayScreenState extends State<DisplayScreen> {
       } catch (_) {}
       _tempVideoPath = null;
     }
-    if (_mediaList.isEmpty) return;
+    if (_mediaList.isEmpty) {
+      if (toDispose != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          toDispose.dispose();
+        });
+      }
+      return;
+    }
     setState(() {
       _currentIndex = (_currentIndex + 1) % _mediaList.length;
     });
     _playCurrent();
+    if (toDispose != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        toDispose.dispose();
+      });
+    }
   }
 
   Widget _buildStackContent() {
@@ -614,50 +790,18 @@ class DisplayScreenState extends State<DisplayScreen> {
           Positioned(
             left: 10,
             top: 10,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                'MAC: $_mac',
-                style: const TextStyle(color: Colors.white70, fontSize: 14),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () async {
+                  final saved = await _showSettingsDialog();
+                  if (saved == true) refetch();
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: const SizedBox(width: 26, height: 26),
               ),
             ),
           ),
-          Positioned(
-            right: 10,
-            top: 10,
-            child: IconButton(
-              icon: const Icon(Icons.settings, color: Colors.white70),
-              onPressed: () async {
-                final saved = await _showSettingsDialog();
-                if (saved == true) refetch();
-              },
-            ),
-          ),
-          if (_mediaList.isNotEmpty && !_loading && _error == null)
-            Positioned(
-              bottom: 10,
-              right: 10,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text(
-                  '${_currentIndex + 1}/${_mediaList.length} - ${_mediaList[_currentIndex].title}',
-                  style: const TextStyle(color: Colors.white70, fontSize: 12),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ),
         ],
       ),
     );
@@ -714,11 +858,26 @@ class DisplayScreenState extends State<DisplayScreen> {
     if (media.isVideo &&
         _videoController != null &&
         _videoController!.value.isInitialized) {
-      return Center(
-        child: AspectRatio(
-          aspectRatio: _videoController!.value.aspectRatio,
-          child: VideoPlayer(_videoController!),
-        ),
+      final controller = _videoController!;
+      final size = controller.value.size;
+      final width = size.width > 0 ? size.width : 16.0;
+      final height = size.height > 0 ? size.height : 9.0;
+      return Stack(
+        fit: StackFit.expand,
+        alignment: Alignment.bottomCenter,
+        children: [
+          Container(color: Colors.black),
+          Center(
+            child: FittedBox(
+              fit: BoxFit.contain,
+              child: SizedBox(
+                width: width,
+                height: height,
+                child: VideoPlayer(controller),
+              ),
+            ),
+          ),
+        ],
       );
     }
     if (media.isVideo && _videoError != null) {
@@ -759,7 +918,7 @@ class DisplayScreenState extends State<DisplayScreen> {
         ),
       );
     }
-    if (media.isVideo && _videoDownloading) {
+    if (media.isVideo && (_videoDownloading || _videoInitializing)) {
       return const Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,

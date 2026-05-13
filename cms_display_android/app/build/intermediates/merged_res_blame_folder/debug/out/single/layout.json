@@ -1,0 +1,14 @@
+[
+    {
+        "merged": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-mergeDebugResources-38:\\layout\\activity_main.xml",
+        "source": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-main-41:\\layout\\activity_main.xml"
+    },
+    {
+        "merged": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-mergeDebugResources-38:\\layout\\content_settings.xml",
+        "source": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-main-41:\\layout\\content_settings.xml"
+    },
+    {
+        "merged": "com.cms.display.app-mergeDebugResources-38:/layout/activity_main.xml",
+        "source": "com.cms.display.app-main-41:/layout/activity_main.xml"
+    }
+]

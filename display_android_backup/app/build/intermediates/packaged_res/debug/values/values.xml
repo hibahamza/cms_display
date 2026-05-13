@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="green_700">#FF388E3C</color>
+    <color name="orange">#FFFF9800</color>
+    <color name="overlay_bg">#8A000000</color>
+    <color name="red">#FFF44336</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="white_38">#61FFFFFF</color>
+    <color name="white_70">#B3FFFFFF</color>
+    <string name="app_name">CMS Display</string>
+    <string name="cancel">Cancel</string>
+    <string name="enter_mac">Enter device MAC address</string>
+    <string name="loading_media">Loading media…</string>
+    <string name="loading_video">Loading video…</string>
+    <string name="mac_address">MAC Address</string>
+    <string name="mac_hint">e.g. 58:c5:87:67:7e:39</string>
+    <string name="no_media_found">No media found</string>
+    <string name="open_video_in_app">Open video in app</string>
+    <string name="please_enter_mac">Please enter a MAC address</string>
+    <string name="retry">Retry</string>
+    <string name="save">Save</string>
+    <string name="save_and_play">Save &amp; Play</string>
+    <string name="settings">Settings</string>
+    <style name="Theme.CmsDisplay" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/green_700</item>
+        <item name="android:statusBarColor">@color/black</item>
+        <item name="android:navigationBarColor">@color/black</item>
+        <item name="android:windowBackground">@color/black</item>
+        <item name="android:textColorPrimary">@color/white</item>
+    </style>
+    <style name="Theme.CmsDisplay.Fullscreen" parent="Theme.CmsDisplay">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>

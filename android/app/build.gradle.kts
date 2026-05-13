@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.cms.cms_display_app"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36
     // Override Flutter's default NDK to match the plugins' requirement.
     ndkVersion = "27.0.12077973"
 

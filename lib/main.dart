@@ -43,10 +43,13 @@ class _CmsDisplayAppState extends State<CmsDisplayApp> {
           primary: Colors.green.shade700,
           surface: Colors.black,
           onSurface: Colors.white,
+          surfaceTint: Colors.transparent,
         ),
+        scaffoldBackgroundColor: Colors.black,
+        canvasColor: Colors.black,
         useMaterial3: true,
       ),
-      home: widget.settings.hasMac
+      home: widget.settings.canShowDisplay
           ? DisplayScreen(
               key: _displayKey,
               settings: widget.settings,

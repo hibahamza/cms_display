@@ -4,10 +4,6 @@
         "source": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-main-41:\\layout\\activity_main.xml"
     },
     {
-        "merged": "com.cms.display.app-merged_res-39:/layout_activity_main.xml.flat",
-        "source": "com.cms.display.app-main-41:/layout/activity_main.xml"
-    },
-    {
         "merged": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-merged_res-39:\\drawable_ic_launcher_background.xml.flat",
         "source": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-main-41:\\drawable\\ic_launcher_background.xml"
     },
@@ -22,6 +18,10 @@
     {
         "merged": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-merged_res-39:\\drawable_badge_bg.xml.flat",
         "source": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-main-41:\\drawable\\badge_bg.xml"
+    },
+    {
+        "merged": "com.cms.display.app-merged_res-39:/drawable_logo1.png.flat",
+        "source": "com.cms.display.app-main-41:/drawable/logo1.png"
     },
     {
         "merged": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-merged_res-39:\\mipmap-anydpi-v26_ic_launcher_round.xml.flat",
@@ -50,5 +50,9 @@
     {
         "merged": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-merged_res-39:\\drawable_icon.png.flat",
         "source": "C:\\Users\\HP\\.gradle\\daemon\\8.2\\com.cms.display.app-main-41:\\drawable\\icon.png"
+    },
+    {
+        "merged": "com.cms.display.app-merged_res-39:/drawable_logo.png.flat",
+        "source": "com.cms.display.app-main-41:/drawable/logo.png"
     }
 ]

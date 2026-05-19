@@ -557,7 +557,8 @@ class MainActivity : AppCompatActivity() {
                                     nextMedia()
                                 }
                                 if (playbackState == Player.STATE_READY) {
-                                    startStallWatchdog()
+                                    // USB/pendrive reads can buffer for a long time; stall watchdog would skip to next clip.
+                                    if (!settings.isUsbMode) startStallWatchdog()
                                     // Only arm once: READY can fire again after buffering; second time pending is null
                                     if (pendingVideoScheduleSeconds != null) {
                                         armVideoScheduleIfNeeded(pendingVideoScheduleSeconds)
@@ -659,7 +660,7 @@ class MainActivity : AppCompatActivity() {
                                     nextMedia()
                                 }
                                 if (playbackState == Player.STATE_READY) {
-                                    startStallWatchdog()
+                                    if (!settings.isUsbMode) startStallWatchdog()
                                     // Only arm once: READY can fire again after buffering; do not cancel schedule on 2nd READY
                                     if (pendingVideoScheduleSeconds != null) {
                                         armVideoScheduleIfNeeded(pendingVideoScheduleSeconds)

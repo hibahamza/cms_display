@@ -15,6 +15,7 @@ drawable ic_launcher_foreground
 drawable icon
 drawable landscape
 drawable logo
+drawable logo1
 drawable portrait
 id btn_save_play
 id btn_select_usb_folder

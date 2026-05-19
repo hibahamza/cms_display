@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -10,8 +13,11 @@ import 'package:video_player/video_player.dart';
 
 import '../models/media_item.dart';
 import '../services/api_service.dart';
+import '../services/local_folder_media.dart';
 import '../services/offline_media_service.dart';
 import '../services/settings_service.dart';
+import '../services/usb_offline_cache_service.dart';
+import '../usb_android_channel.dart';
 
 /// Full-screen display: fetches media by MAC and plays images (10s) and videos (to end), then loops.
 /// When online: fetches from API, saves list and caches files via Hive. When offline, plays from local cache.
@@ -57,6 +63,11 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
   /// Brief message when video download/play fails (cleared on next media).
   String? _videoError;
 
+  /// Last reported decoder geometry — triggers rebuild when rotation/size updates.
+  double? _videoLayoutW;
+  double? _videoLayoutH;
+  int? _videoLayoutRot;
+
   Timer? _cmsRefreshTimer;
   Timer? _cmsFirstRefreshTimer;
   bool _cmsBackgroundRefreshInFlight = false;
@@ -68,13 +79,23 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _fetchMedia();
-    _startCmsRefreshTimer();
+    if (Platform.isAndroid || Platform.isIOS) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+    if (widget.settings.isUsbSourceMode) {
+      unawaited(_loadUsbMedia());
+    } else {
+      _fetchMedia();
+      _startCmsRefreshTimer();
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      if (Platform.isAndroid || Platform.isIOS) {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      }
       unawaited(_refreshCmsMediaIfOnline());
     }
   }
@@ -106,10 +127,19 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
     _scheduledNextTimer?.cancel();
     _videoStallTimer?.cancel();
     _videoController?.dispose();
+    if (Platform.isAndroid || Platform.isIOS) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     super.dispose();
   }
 
-  void refetch() => _fetchMedia();
+  void refetch() {
+    if (widget.settings.isUsbSourceMode) {
+      unawaited(_loadUsbMedia());
+    } else {
+      _fetchMedia();
+    }
+  }
 
   String _userFriendlyError(Object e) {
     if (e is ApiException) return e.message;
@@ -133,101 +163,191 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
       text: widget.settings.macAddress,
     );
     final urlController = TextEditingController(text: widget.settings.baseUrl);
+    var usbMode = widget.settings.isUsbSourceMode;
+    var usbPick = widget.settings.usbDocumentTreeUri.trim().isNotEmpty
+        ? widget.settings.usbDocumentTreeUri
+        : widget.settings.usbFolderPath;
     try {
       return await showDialog<bool>(
         context: context,
-        builder: (ctx) => AlertDialog(
-          backgroundColor: const Color(0xFF222222),
-          title: const Text('Settings', style: TextStyle(color: Colors.white)),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // const Text(
-                //   'Server URL',
-                //   style: TextStyle(color: Colors.white70, fontSize: 14),
-                // ),
-                // const SizedBox(height: 6),
-                // TextField(
-                //   controller: urlController,
-                //   style: const TextStyle(color: Colors.white),
-                //   decoration: InputDecoration(
-                //     hintText: 'https://abettech.com/cms/public',
-                //     hintStyle: TextStyle(color: Colors.white.withOpacity(0.5)),
-                //     border: const OutlineInputBorder(),
-                //     enabledBorder: const OutlineInputBorder(
-                //       borderSide: BorderSide(color: Colors.white38),
-                //     ),
-                //     focusedBorder: const OutlineInputBorder(
-                //       borderSide: BorderSide(color: Colors.white),
-                //     ),
-                //   ),
-                //   keyboardType: TextInputType.url,
-                //   autocorrect: false,
-                // ),
-                // const SizedBox(height: 16),
-                const Text(
-                  'MAC Address',
-                  style: TextStyle(color: Colors.white70, fontSize: 14),
-                ),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: macController,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    hintText: 'e.g. 58:c5:87:67:7e:39',
-                    hintStyle: TextStyle(color: Colors.white.withOpacity(0.5)),
-                    border: const OutlineInputBorder(),
-                    enabledBorder: const OutlineInputBorder(
-                      borderSide: BorderSide(color: Colors.white38),
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialog) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF222222),
+              title: const Text(
+                'Settings',
+                style: TextStyle(color: Colors.white),
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text(
+                      'Media source',
+                      style: TextStyle(color: Colors.white70, fontSize: 14),
                     ),
-                    focusedBorder: const OutlineInputBorder(
-                      borderSide: BorderSide(color: Colors.white),
+                    const SizedBox(height: 6),
+                    RadioListTile<bool>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text(
+                        'CMS (network)',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      value: false,
+                      groupValue: usbMode,
+                      onChanged: (v) {
+                        if (v != null) setDialog(() => usbMode = v);
+                      },
                     ),
-                  ),
-                  textCapitalization: TextCapitalization.characters,
-                  inputFormatters: [
-                    FilteringTextInputFormatter.allow(
-                      RegExp(r'[0-9A-Fa-f:.-]'),
+                    RadioListTile<bool>(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text(
+                        'Pendrive / USB folder',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      value: true,
+                      groupValue: usbMode,
+                      onChanged: (v) {
+                        if (v != null) setDialog(() => usbMode = v);
+                      },
                     ),
+                    const SizedBox(height: 12),
+                    if (!usbMode) ...[
+                      const Text(
+                        'MAC Address',
+                        style: TextStyle(color: Colors.white70, fontSize: 14),
+                      ),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: macController,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: 'e.g. 58:c5:87:67:7e:39',
+                          hintStyle: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.5),
+                          ),
+                          border: const OutlineInputBorder(),
+                          enabledBorder: const OutlineInputBorder(
+                            borderSide: BorderSide(color: Colors.white38),
+                          ),
+                          focusedBorder: const OutlineInputBorder(
+                            borderSide: BorderSide(color: Colors.white),
+                          ),
+                        ),
+                        textCapitalization: TextCapitalization.characters,
+                        inputFormatters: [
+                          FilteringTextInputFormatter.allow(
+                            RegExp(r'[0-9A-Fa-f:.-]'),
+                          ),
+                        ],
+                      ),
+                    ] else ...[
+                      Text(
+                        usbPick.isEmpty
+                            ? (Platform.isAndroid
+                                ? 'No USB folder yet. Tap the button and select your pendrive in the system dialog.'
+                                : 'No folder selected. Tap the button and choose the pendrive folder (or a subfolder with your media).')
+                            : usbPick,
+                        style: TextStyle(
+                          color: usbPick.isEmpty
+                              ? Colors.orange.shade200
+                              : Colors.white70,
+                          fontSize: 13,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          if (Platform.isAndroid) {
+                            final u = await UsbAndroidChannel.openDocumentTree();
+                            if (u != null && u.isNotEmpty) {
+                              setDialog(() => usbPick = u);
+                            }
+                          } else {
+                            final picked =
+                                await FilePicker.platform.getDirectoryPath();
+                            if (picked != null && picked.isNotEmpty) {
+                              setDialog(() => usbPick = picked);
+                            }
+                          }
+                        },
+                        icon: const Icon(Icons.folder_open, color: Colors.white70),
+                        label: Text(
+                          Platform.isAndroid
+                              ? 'Choose USB / pendrive'
+                              : 'Choose folder',
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(false),
+                  child: const Text(
+                    'Cancel',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    if (!usbMode) {
+                      final mac = macController.text.trim();
+                      if (mac.isEmpty) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Please enter a MAC address'),
+                          ),
+                        );
+                        return;
+                      }
+                      final url = urlController.text.trim();
+                      if (url.isNotEmpty) {
+                        widget.settings.baseUrl = url.endsWith('/')
+                            ? url.substring(0, url.length - 1)
+                            : url;
+                      }
+                      widget.settings.sourceMode = SettingsService.sourceCms;
+                      widget.settings.macAddress = mac;
+                      widget.settings.usbHasLocalPlaylist = false;
+                      unawaited(UsbOfflineCacheService.instance.clearAll());
+                      Navigator.of(ctx).pop(true);
+                      return;
+                    }
+                    if (usbPick.trim().isEmpty) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text(
+                            'Choose a USB folder for Pendrive playback',
+                          ),
+                        ),
+                      );
+                      return;
+                    }
+                    widget.settings.sourceMode = SettingsService.sourceUsb;
+                    if (Platform.isAndroid &&
+                        usbPick.trim().startsWith('content://')) {
+                      widget.settings.usbDocumentTreeUri = usbPick.trim();
+                      widget.settings.usbFolderPath = '';
+                    } else {
+                      widget.settings.usbFolderPath = usbPick.trim();
+                      widget.settings.usbDocumentTreeUri = '';
+                    }
+                    Navigator.of(ctx).pop(true);
+                  },
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.green.shade700,
+                  ),
+                  child: const Text('Save'),
+                ),
               ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
-              child: const Text(
-                'Cancel',
-                style: TextStyle(color: Colors.white70),
-              ),
-            ),
-            FilledButton(
-              onPressed: () {
-                final mac = macController.text.trim();
-                final url = urlController.text.trim();
-                if (mac.isEmpty) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Please enter a MAC address')),
-                  );
-                  return;
-                }
-                if (url.isNotEmpty) {
-                  widget.settings.baseUrl = url.endsWith('/')
-                      ? url.substring(0, url.length - 1)
-                      : url;
-                }
-                widget.settings.macAddress = mac;
-                Navigator.of(ctx).pop(true);
-              },
-              style: FilledButton.styleFrom(
-                backgroundColor: Colors.green.shade700,
-              ),
-              child: const Text('Save'),
-            ),
-          ],
+            );
+          },
         ),
       );
     } finally {
@@ -236,7 +356,123 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
     }
   }
 
+  Future<void> _loadUsbMedia() async {
+    _cmsFirstRefreshTimer?.cancel();
+    _cmsRefreshTimer?.cancel();
+
+    final treeUri = widget.settings.usbDocumentTreeUri.trim();
+    final folder = widget.settings.usbFolderPath.trim();
+    final sourceKey = treeUri.isNotEmpty ? treeUri : folder;
+
+    Future<void> showUsbError(String msg) async {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _mediaList = [];
+        _error = msg;
+      });
+    }
+
+    // 1) Play from last successful import (pendrive can be unplugged).
+    if (sourceKey.isNotEmpty || widget.settings.usbHasLocalPlaylist) {
+      final cached = await UsbOfflineCacheService.instance.tryLoadCachedPlaylist(
+        sourceKeyFromSettings: sourceKey,
+        hasLocalFlag: widget.settings.usbHasLocalPlaylist,
+      );
+      if (cached != null && cached.isNotEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _mediaList = cached;
+          _loading = false;
+          _currentIndex = 0;
+          _error = null;
+        });
+        _playCurrent();
+        return;
+      }
+    }
+
+    // 2) Need live access to pendrive / folder to list and copy.
+    if (treeUri.isEmpty && folder.isEmpty) {
+      await showUsbError(
+        Platform.isAndroid
+            ? 'Connect the pendrive or use Settings to choose USB again. Imported media will play here without the drive.'
+            : 'Choose a folder in Settings (Pendrive), or connect the drive if you already imported once.',
+      );
+      return;
+    }
+
+    List<MediaItem>? remoteList;
+    if (UsbAndroidChannel.isSupported && treeUri.isNotEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+      try {
+        remoteList = await UsbAndroidChannel.listTreeMedia(treeUri);
+      } catch (e) {
+        await showUsbError('Could not read USB folder: $e');
+        return;
+      }
+    } else if (folder.isNotEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+      try {
+        remoteList = await compute(scanLocalMediaFolderSync, folder);
+      } catch (e) {
+        await showUsbError('Cannot read folder: $e');
+        return;
+      }
+    } else {
+      await showUsbError(
+        Platform.isAndroid
+            ? 'Tap Settings → Pendrive → Choose USB folder and pick your pendrive in the system dialog.'
+            : 'Choose a folder: Settings → Pendrive / USB folder.',
+      );
+      return;
+    }
+
+    final remote = remoteList ?? [];
+    if (remote.isEmpty) {
+      await showUsbError('No photos or videos in this folder.');
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final localList = await UsbOfflineCacheService.instance.importAndPersist(
+        remote,
+        sourceKey,
+      );
+      widget.settings.usbHasLocalPlaylist = true;
+      if (!mounted) return;
+      setState(() {
+        _mediaList = localList;
+        _loading = false;
+        _currentIndex = 0;
+        _error =
+            localList.isEmpty ? 'No media could be copied for offline play.' : null;
+      });
+      if (localList.isNotEmpty) _playCurrent();
+    } catch (e) {
+      await showUsbError('Failed to copy media for offline playback: $e');
+    }
+  }
+
   Future<void> _fetchMedia() async {
+    if (widget.settings.isUsbSourceMode) {
+      await _loadUsbMedia();
+      return;
+    }
     if (_mac.trim().isEmpty) return;
     setState(() {
       _loading = true;
@@ -258,6 +494,7 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
           _error = playable.isEmpty ? 'No media found for this device' : null;
         });
         if (playable.isNotEmpty) _playCurrent();
+        _startCmsRefreshTimer();
       } catch (e) {
         final msg = _userFriendlyError(e);
         await _loadFromOffline(msg);
@@ -279,6 +516,7 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
         _error = null;
       });
       if (playable.isNotEmpty) _playCurrent();
+      _startCmsRefreshTimer();
     } else {
       setState(() {
         _loading = false;
@@ -305,7 +543,12 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
   /// Silent background fetch: does not show loading screen; updates loop if playlist changed.
   /// Does not use [_loading] so the first scheduled refresh is not skipped during a slow initial fetch.
   Future<void> _refreshCmsMediaIfOnline() async {
-    if (!mounted || _mac.trim().isEmpty || _cmsBackgroundRefreshInFlight) return;
+    if (!mounted ||
+        widget.settings.isUsbSourceMode ||
+        _mac.trim().isEmpty ||
+        _cmsBackgroundRefreshInFlight) {
+      return;
+    }
     final results = await Connectivity().checkConnectivity();
     if (!_isOnlineForApi(results) || !mounted) return;
     _cmsBackgroundRefreshInFlight = true;
@@ -378,6 +621,30 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
     );
   }
 
+  /// Texture rendering on Android + Impeller often pads the Surface with chroma (green stripe).
+  /// Platform views draw via SurfaceView and avoid that path.
+  static VideoViewType _videoViewTypeForPlatform() {
+    if (Platform.isAndroid) return VideoViewType.platformView;
+    return VideoViewType.textureView;
+  }
+
+  /// Footprint for scaling around [VideoPlayer] (swap WxH when Flutter rotates 90°/270°).
+  Size _videoLayoutDimensions(VideoPlayerController controller) {
+    final v = controller.value;
+    var w = v.size.width;
+    var h = v.size.height;
+    if (!v.isInitialized || w <= 0 || h <= 0) {
+      return const Size(16, 9);
+    }
+    final rot = ((v.rotationCorrection % 360) + 360) % 360;
+    if (rot == 90 || rot == 270) {
+      final t = w;
+      w = h;
+      h = t;
+    }
+    return Size(w, h);
+  }
+
   /// Browser-like UA; large MP4s need slower stall detection and longer [initialize] timeout.
   static const _videoHeaders = <String, String>{
     'User-Agent':
@@ -416,10 +683,23 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
     _videoError = null;
     _videoErrorUrl = null;
     _videoInitializing = true;
+    _videoLayoutW = null;
+    _videoLayoutH = null;
+    _videoLayoutRot = null;
     setState(() {});
     if (media.isCached && media.localPath != null) {
-      print('🎥 DEBUG: Using cached file: ${media.localPath}');
-      _videoController = VideoPlayerController.file(File(media.localPath!));
+      final lp = media.localPath!;
+      if (Platform.isAndroid && lp.startsWith('content://')) {
+        _videoController = VideoPlayerController.contentUri(
+          Uri.parse(lp),
+          viewType: _videoViewTypeForPlatform(),
+        );
+      } else {
+        _videoController = VideoPlayerController.file(
+          File(lp),
+          viewType: _videoViewTypeForPlatform(),
+        );
+      }
       _initAndPlayVideoController();
       return;
     }
@@ -430,6 +710,7 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
     _videoController = VideoPlayerController.networkUrl(
       videoUri,
       httpHeaders: _videoHeaders,
+      viewType: _videoViewTypeForPlatform(),
     );
     _videoController!.setLooping(false);
     print('🎥 DEBUG: Starting video initialization...');
@@ -517,6 +798,7 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
     _videoController = VideoPlayerController.networkUrl(
       videoUri,
       httpHeaders: _videoHeaders,
+      viewType: _videoViewTypeForPlatform(),
     );
     _videoController!.setLooping(false);
     _videoController!
@@ -560,7 +842,9 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
           _videoController!.play();
           setState(() {});
           _videoController!.addListener(_videoListener);
-          _armVideoStallWatchdog();
+          if (!widget.settings.isUsbSourceMode) {
+            _armVideoStallWatchdog();
+          }
           _armVideoScheduleSlotTimer();
         })
         .catchError((e) {
@@ -624,7 +908,10 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
       }
       if (!mounted) return;
       _tempVideoPath = file.path;
-      _videoController = VideoPlayerController.file(file);
+      _videoController = VideoPlayerController.file(
+        file,
+        viewType: _videoViewTypeForPlatform(),
+      );
       await _videoController!.initialize().timeout(
         const Duration(seconds: 20),
         onTimeout: () => throw TimeoutException('Video init timeout'),
@@ -663,6 +950,18 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
   void _videoListener() {
     if (_videoController == null || !mounted || _videoEndHandled) return;
     final value = _videoController!.value;
+    if (value.isInitialized) {
+      final sz = value.size;
+      final rot = value.rotationCorrection;
+      if (_videoLayoutW != sz.width ||
+          _videoLayoutH != sz.height ||
+          _videoLayoutRot != rot) {
+        _videoLayoutW = sz.width;
+        _videoLayoutH = sz.height;
+        _videoLayoutRot = rot;
+        setState(() {});
+      }
+    }
     final pos = value.position;
     final dur = value.duration;
     final hasError = value.hasError;
@@ -712,6 +1011,9 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
     final toDispose = _videoController;
     _videoController?.removeListener(_videoListener);
     _videoController = null;
+    _videoLayoutW = null;
+    _videoLayoutH = null;
+    _videoLayoutRot = null;
     _videoDownloading = false;
     _videoInitializing = false;
     _videoError = null;
@@ -781,28 +1083,40 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
 
   @override
   Widget build(BuildContext context) {
+    final baseTheme = Theme.of(context);
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          _buildStackContent(),
-          Positioned(
-            left: 10,
-            top: 10,
-            child: Material(
-              color: Colors.transparent,
-              child: InkWell(
-                onTap: () async {
-                  final saved = await _showSettingsDialog();
-                  if (saved == true) refetch();
-                },
-                borderRadius: BorderRadius.circular(4),
-                child: const SizedBox(width: 26, height: 26),
+      body: Theme(
+        data: baseTheme.copyWith(
+          canvasColor: Colors.black,
+          scaffoldBackgroundColor: Colors.black,
+          colorScheme: baseTheme.colorScheme.copyWith(
+            surfaceTint: Colors.transparent,
+            surface: Colors.black,
+            primary: Colors.black,
+          ),
+        ),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            _buildStackContent(),
+            Positioned(
+              left: 10,
+              top: 10,
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: () async {
+                    final saved = await _showSettingsDialog();
+                    if (saved == true) refetch();
+                  },
+                  borderRadius: BorderRadius.circular(4),
+                  child: const SizedBox(width: 26, height: 26),
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -810,6 +1124,24 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
   Widget _buildPlayer() {
     final media = _mediaList[_currentIndex];
     if (media.isImage) {
+      final lp = media.localPath;
+      if (lp != null &&
+          lp.isNotEmpty &&
+          Platform.isAndroid &&
+          lp.startsWith('content://')) {
+        return InteractiveViewer(
+          minScale: 0.5,
+          maxScale: 4,
+          child: Center(
+            child: _UsbContentImage(
+              contentUri: lp,
+              onLoadFailed: () {
+                if (mounted) _nextMedia();
+              },
+            ),
+          ),
+        );
+      }
       final useFile = media.isCached && media.localPath != null;
       return InteractiveViewer(
         minScale: 0.5,
@@ -859,22 +1191,45 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
         _videoController != null &&
         _videoController!.value.isInitialized) {
       final controller = _videoController!;
-      final size = controller.value.size;
-      final width = size.width > 0 ? size.width : 16.0;
-      final height = size.height > 0 ? size.height : 9.0;
+      final dim = _videoLayoutDimensions(controller);
       return Stack(
         fit: StackFit.expand,
-        alignment: Alignment.bottomCenter,
         children: [
-          Container(color: Colors.black),
-          Center(
-            child: FittedBox(
-              fit: BoxFit.contain,
-              child: SizedBox(
-                width: width,
-                height: height,
-                child: VideoPlayer(controller),
-              ),
+          const ColoredBox(color: Colors.black),
+          Positioned.fill(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final vw = constraints.maxWidth;
+                final vh = constraints.maxHeight;
+                if (vw <= 0 || vh <= 0 || dim.width <= 0 || dim.height <= 0) {
+                  return const ColoredBox(color: Colors.black);
+                }
+                final sx = vw / dim.width;
+                final sy = vh / dim.height;
+                final cover = math.max(sx, sy);
+                final overscan = cover * 1.06;
+                return ClipRect(
+                  clipBehavior: Clip.hardEdge,
+                  child: ColoredBox(
+                    color: Colors.black,
+                    child: SizedBox(
+                      width: vw,
+                      height: vh,
+                      child: Center(
+                        child: Transform.scale(
+                          scale: overscan,
+                          alignment: Alignment.center,
+                          child: SizedBox(
+                            width: dim.width,
+                            height: dim.height,
+                            child: VideoPlayer(controller),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
           ),
         ],
@@ -931,5 +1286,70 @@ class DisplayScreenState extends State<DisplayScreen> with WidgetsBindingObserve
       );
     }
     return const Center(child: CircularProgressIndicator(color: Colors.white));
+  }
+}
+
+/// Loads a SAF `content://` image via a temp cache file (Android only).
+class _UsbContentImage extends StatefulWidget {
+  const _UsbContentImage({
+    required this.contentUri,
+    required this.onLoadFailed,
+  });
+
+  final String contentUri;
+  final VoidCallback onLoadFailed;
+
+  @override
+  State<_UsbContentImage> createState() => _UsbContentImageState();
+}
+
+class _UsbContentImageState extends State<_UsbContentImage> {
+  late final Future<String?> _pathFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _pathFuture = UsbAndroidChannel.copyUriToCacheFile(widget.contentUri);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<String?>(
+      future: _pathFuture,
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(
+            child: CircularProgressIndicator(color: Colors.white),
+          );
+        }
+        final path = snap.data;
+        if (path == null || path.isEmpty) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            widget.onLoadFailed();
+          });
+          return const Center(
+            child: Text(
+              'Failed to load image',
+              style: TextStyle(color: Colors.white70),
+            ),
+          );
+        }
+        return Image.file(
+          File(path),
+          fit: BoxFit.contain,
+          errorBuilder: (_, __, ___) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              widget.onLoadFailed();
+            });
+            return const Center(
+              child: Text(
+                'Failed to load image',
+                style: TextStyle(color: Colors.white70),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 }
